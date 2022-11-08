@@ -1,0 +1,48 @@
+name: push-clean-workflow
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - ".github/workflows/clean-team-members-json.yaml"
+
+jobs:
+  getAllBranches:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{steps.get_branches.outputs.matrix}}
+
+    steps: 
+    - name: Checkout
+      uses: actions/checkout@v2
+      with:
+        fetch-depth: 0
+
+    - id: get_branches
+      run: echo "::set-output name=matrix::$(git branch -r | sed 's/origin\///g' | grep -v -w "master" | uniq | sed 's/ //g' | jq -cnR '[inputs | select(length>0)]')"
+    
+
+
+  copyfile:
+    runs-on: ubuntu-latest
+    needs: getAllBranches
+    strategy:
+      fail-fast: false
+      matrix:
+        branch_name: ${{fromJson(needs.getAllBranches.outputs.matrix)}}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v2
+
+    - name: Pushes test file
+      uses: dmnemec/copy_file_to_another_repo_action@80732d64341473fa7165a3b2b6c7b0ee164193f8
+      env:
+        API_TOKEN_GITHUB: "${{secrets.GHA_IAM_WORKFLOW}}"
+      with:
+        source_file: '.github/workflows/clean-team-members-json.yaml'
+        destination_repo: "Pluto-tv/${{ github.event.repository.name }}"
+        destination_folder: '.github/workflows/'
+        destination_branch: ${{matrix.branch_name}}
+        user_email: 'github.deploy@pluto.tv'
+        user_name: 'pluto-deploy'
+        commit_message: 'Pushing Updated main workflow'

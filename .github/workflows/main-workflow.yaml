@@ -1,0 +1,1553 @@
+name: main-workflow
+on:
+  push:
+    paths-ignore:
+      - '**.md'
+      - '.github/workflows/cft*.yaml'
+  pull_request:
+    branches:
+      - develop
+    types: [opened, synchronize, reopened, edited]
+
+concurrency:
+  group: ${{ github.ref || github.run_id }}
+  cancel-in-progress: true
+    
+jobs:
+
+  submitted_pullRequest:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    env: 
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACKWEBHOOK }}
+    
+    steps:
+      - name: Checkout 
+        uses: actions/checkout@v2
+
+      - name: slack notification
+        if: success()
+        env:
+          orgRepo: "${{ github.repository }}"
+          pullno: "${{ github.event.number }}"
+        uses: jannekem/run-python-script-action@v1.2
+        with:
+          script: |
+            import os
+            import json
+            import requests
+            
+            slack_webhook_url = os.environ['SLACK_WEBHOOK_URL']
+            repositoryName = os.environ['orgRepo']
+            channelName = repositoryName.replace('product-security-aws-tiers-','')
+            channelName = channelName + "-tier-access"
+            pullreqNumber = os.environ['pullno']
+            PR_url = f"https://github.com/{repositoryName}/pull/{pullreqNumber}"
+            PR_files_url = f"{PR_url}/files"
+            message = f'''<!here> Your recent <{PR_url}|*PR #{pullreqNumber}*> has been submitted.
+            The Product Security team Automation is currently validating the PR.
+            '''
+
+            slack_message = {
+            'channel': channelName,
+            'text': message
+            }  
+            
+            response = requests.post(slack_webhook_url, data=json.dumps(slack_message),headers={'Content-Type': 'application/json'})
+            if response.status_code != 200:
+                raise ValueError('Request to slack returned an error %s, the response is:\n%s' % (response.status_code, response.text))
+
+
+  start_deployment:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/master'
+    env: 
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACKWEBHOOK }}
+    
+    steps:
+      - name: Checkout now
+        uses: actions/checkout@v2
+
+      - name: slack notification
+        env:
+          orgRepo: "${{ github.repository }}"
+          runid: "${{ github.run_id }}"
+        uses: jannekem/run-python-script-action@v1.2
+        with:
+          script: |
+            import os
+            import json
+            import requests
+            
+            slack_webhook_url = os.environ['SLACK_WEBHOOK_URL']
+            repositoryName = os.environ['orgRepo']
+            run_id = os.environ['runid']
+            channelName = repositoryName.replace('product-security-aws-tiers-','')
+            channelName = channelName + "-tier-access"
+            run_url = f"https://github.com/{repositoryName}/actions/runs/{run_id}"
+            message = f'''<!here> *Deployment Notification*
+            *Job ID: `{run_id}`*
+            *Status: `Deploying` :spinner:*
+              • Team Tier deployment has started. Please view <{run_url}|*The Deployment {run_id} Summary*> to look at the progress of the deployment.
+              • When this deploy is finished this channel will be notified automatically.
+            ----------------------------------------------------------------------------------------------------------------------------------------
+            '''
+
+            slack_message = {
+            'channel': channelName,
+            'text': message
+            } 
+            print(slack_webhook_url)
+            print(repositoryName)
+            print(channelName) 
+            print(slack_message)
+            response = requests.post(slack_webhook_url, data=json.dumps(slack_message),headers={'Content-Type': 'application/json'})
+            if response.status_code != 200:
+                raise ValueError('Request to slack returned an error %s, the response is:\n%s' % (response.status_code, response.text))
+
+  validate_team_members_json:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{steps.list_valid_tiers.outputs.matrix}} 
+    # if: github.ref == 'refs/heads/master'
+
+    steps:
+      - name: Checkout now
+        uses: actions/checkout@v2
+
+      - name: Setup Python
+        uses: actions/setup-python@v2.2.2
+        with:
+          python-version: 3.9
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install awscli
+          pip install boto3
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_ANALYZER_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_ACCESS_ANALYZER_SECRET }}
+          aws-region: us-east-1
+          mask-aws-account-id: 'no'
+
+      - name: validate team_members.json
+        uses: jannekem/run-python-script-action@v1.2
+        with:
+          script: |
+            import os
+            import json
+            import boto3
+            import glob
+            import shutil
+            import re
+            import sys
+
+            iam = boto3.client('iam')
+
+            def exists(user_name):
+              try:
+                iam.list_user_policies(UserName=user_name)
+                return True
+              except iam.exceptions.NoSuchEntityException:
+                return False
+            
+            f_team_members = open('team_members.json', "r")
+            data_team_members = json.loads(f_team_members.read())  
+            
+            with open('valid_team_tiers.txt', 'w') as valid:
+              for t,ul in data_team_members.items():
+                if ul:
+                  valid.write(t+"\n")
+                  for item in ul:
+                    iam_usr = re.search('user/(.*)', item).group(1)
+                    if exists(iam_usr):
+                      pass
+                    else:
+                      print(f"User {iam_usr} does not exist in 157385605725 aws account")
+                      with open('user_does_not_exist.txt', 'a') as chk:
+                        chk.write(iam_usr+"\n")
+                      # sys.exit(1)
+            
+      - name: If user does not exist
+        id: if_userexists_fails
+        if: hashFiles('user_does_not_exist.txt') != ''
+        uses: actions/upload-artifact@v2.2.4
+        with: 
+          name: user_does_not_exist.txt
+          path: ./user_does_not_exist.txt
+
+      - name: Fail if user does not exist
+        if: hashFiles('user_does_not_exist.txt') != ''
+        run: exit 1
+              
+      - id: list_valid_tiers
+        run: echo "::set-output name=matrix::$(cat valid_team_tiers.txt  | uniq | jq -cnR '[inputs | select(length>0)]')"
+      
+      - name: Print Valid Tiers
+        run: echo "${{steps.list_valid_tiers.outputs.matrix}}"
+      
+      - name: Upload valid team tiers file
+        uses: actions/upload-artifact@v2.2.4
+        with: 
+          name: valid_team_tiers.txt
+          path: ./valid_team_tiers.txt
+  
+  build:
+    runs-on: ubuntu-latest
+    needs: [validate_team_members_json]
+    if: success()
+    outputs:
+      matrix: ${{steps.list_accounts.outputs.matrix}}
+      repoIdentifier: ${{steps.getrepo.outputs.repoIdentifier}}
+    steps:
+      
+      - name: Checkout now
+        uses: actions/checkout@v2
+      
+      - name: Setup Python
+        uses: actions/setup-python@v2.2.2
+        with:
+          python-version: 3.9
+
+      - id: getrepo
+        run: echo "::set-output name=repoIdentifier::$(echo ${GITHUB_REPOSITORY#*/} | sed 's/product-security-aws-tiers//g;s/-poc//g;s/-/ /g' | awk '{for (i=1;i<=NF;i++) $i=toupper(substr($i,1,1)) substr($i,2)} 1' | sed 's/ //g')" 
+          
+      - name: Create manifest.json file
+        uses: jannekem/run-python-script-action@v1.2
+        env: 
+          repoName: ${{steps.getrepo.outputs.repoIdentifier}} 
+        with:
+          script: |
+            import os
+            import json
+            tierdict, result, tiers = {}, {}, []
+            top = os.getcwd()
+          
+            def tierDictforAccount(dirlist):
+              for i in dirlist:
+                tierlist, tierorder = [], {}
+                tierlist = [os.path.basename(a).replace("Tier", "") for a in os.scandir(i)]
+                tierorder['highestTier'], tierorder['lowestTier'], tierdict[i] = max(tierlist, default=0), min(tierlist, default=0), tierorder
+                tiers.append(tierorder['highestTier'])
+              return tierdict
+
+            dirlist = list(set([f.name for f in os.scandir(top) if f.is_dir() for p in os.scandir(f.name) if "Tier" in p.name]))
+            repoName = os.environ['repoName']
+            accounts = tierDictforAccount(dirlist)
+            result['accounts'] = accounts
+            result['ids'] = dirlist
+            result['highestTier'] = max(tiers, default=0)
+            result['repoIdentifier'] = repoName
+            with open('manifest.json', 'w') as fp:
+              fp.write(json.dumps(result, indent=4))
+      
+      - id: list_accounts
+        run: echo "::set-output name=matrix::$(ls -d **/Tier*/ | awk -F'/' '{ print $1 }' | uniq | jq -cnR '[inputs | select(length>0)]')"
+        
+      - name: Print accounts
+        run: echo "${{steps.list_accounts.outputs.matrix}}"
+      
+      - name: Upload manifest.json file
+        uses: actions/upload-artifact@v2.2.4
+        with: 
+          name: manifest.json
+          path: ./manifest.json
+
+  Validate-IAM-Policies:
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: ${{ needs.build.outputs.matrix != '[]' && needs.build.outputs.matrix != '' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        account_id: ${{fromJson(needs.build.outputs.matrix)}}
+
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v2
+        
+      - name: Checkout Pluto-tv/github-actions github action
+        uses: actions/checkout@v2
+        with:
+          repository: Pluto-tv/github-actions
+          ref: refs/heads/master
+          token: ${{ secrets.GHA_IAM_WORKFLOW }}
+          persist-credentials: false
+          path: ./.github/actions/github-actions
+
+      - name: Use Node.js v12
+        uses: actions/setup-node@v2
+        with:
+          node-version: 12
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_ANALYZER_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_ACCESS_ANALYZER_SECRET }}
+          aws-region: us-east-1
+          mask-aws-account-id: 'no'
+
+      - name: IAM source linter
+        id: iam-lint-source
+        if: success() && github.ref != 'refs/heads/master'
+        uses: ./.github/actions/github-actions/actions/iam-policy-lint
+        env:
+          FORCE_COLOR: 3
+        with:
+          prefix: ${{steps.getrepo.outputs.repoIdentifier}}
+          account_id: ${{ matrix.account_id }}
+
+      - name: IAM builder
+        id: iam-policy-compile
+        if: success() && github.ref == 'refs/heads/master'
+        uses: ./.github/actions/github-actions/actions/iam-policy-compile
+        env:
+          FORCE_COLOR: 3
+        with:
+          prefix: ${{steps.getrepo.outputs.repoIdentifier}}
+          account_id: ${{ matrix.account_id }}
+
+      - name: Archive IAM artifacts
+        if: success() && github.ref == 'refs/heads/master'
+        uses: actions/upload-artifact@v2
+        with:
+          name: iam-policy-compile-${{ matrix.account_id }}
+          retention-days: 3
+          path: |
+            ${{ steps.iam-policy-compile.outputs.dist }}   
+    
+  close_pullRequest:
+    runs-on: ubuntu-latest
+    needs: [validate_team_members_json, build, Validate-IAM-Policies]
+    if: ${{ always() && contains(join(needs.*.result, ','), 'failure') && github.event_name == 'pull_request' }}
+    env: 
+      repoName: "${{needs.build.outputs.repoIdentifier}}"
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACKWEBHOOK }}
+    
+    steps:
+      - name: Checkout 
+        uses: actions/checkout@v2
+      
+      - name: Download all artifacts
+        uses: actions/download-artifact@v2.0.10
+        with:
+          path: allartifacts
+      
+      - name: Display structure of downloaded files
+        run: ls -R
+
+      - name: Close pull pullRequest
+        if: github.event_name == 'pull_request'
+        uses: peter-evans/close-pull@v1
+        with:
+          token: "${{secrets.GHA_IAM_WORKFLOW}}"
+          repository: "${{ github.repository }}"
+          pull-request-number: "${{ github.event.number }}"
+          comment: 'Workflow Run ${{ github.run_id }} validation failed. Closing the Pull request.'
+          delete-branch: false
+
+      - name: slack notification
+        if: success() && github.event_name == 'pull_request'
+        env:
+          orgRepo: "${{ github.repository }}"
+          pullno: "${{ github.event.number }}"
+          runid: "${{ github.run_id }}"
+        uses: jannekem/run-python-script-action@v1.2
+        with:
+          script: |
+            import os
+            import json
+            import requests
+            
+            slack_webhook_url = os.environ['SLACK_WEBHOOK_URL']
+            repositoryName = os.environ['orgRepo']
+            run_id = os.environ['runid']
+            run_url = f"https://github.com/{repositoryName}/actions/runs/{run_id}"
+            channelName = repositoryName.replace('product-security-aws-tiers-','')
+            channelName = channelName + "-tier-access"
+            pullreqNumber = os.environ['pullno']
+            PR_url = f"https://github.com/{repositoryName}/pull/{pullreqNumber}"
+            PR_files_url = f"{PR_url}/files"
+            productsecurity_notifications_slack = "https://hooks.slack.com/services/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"
+
+            iam_usr = ""
+            if os.path.exists(f"./allartifacts/user_does_not_exist.txt/user_does_not_exist.txt"):
+              with open("./allartifacts/user_does_not_exist.txt/user_does_not_exist.txt", "r") as f:
+                iam_usr = f.read()
+
+            if iam_usr == "" :
+              message = f'''<!here> Your recent <{PR_url}|*PR #{pullreqNumber}*> Validation has *`FAILED`*. Your PR has been closed as a result.
+            Please correct the <{PR_files_url}|*invalid code*> in your branch and submit a new PR.
+            '''
+            else: 
+              message = f'''<!here> Your recent <{PR_url}|*PR #{pullreqNumber}*> Validation has *`FAILED`* because the following users do not exist in AWS. 
+            {iam_usr}
+            Product Security is looking into it and will reopen the PR after the correction is made.
+            '''
+
+            slack_message = {
+            'channel': channelName,
+            'text': message
+            }  
+            
+            response = requests.post(slack_webhook_url, data=json.dumps(slack_message),headers={'Content-Type': 'application/json'})
+            if response.status_code != 200:
+                raise ValueError('Request to slack returned an error %s, the response is:\n%s' % (response.status_code, response.text))
+
+            if iam_usr != "" :
+              slack_message_failed = {
+              'channel': "product-security-tier-notifications",
+              'text': message
+              }
+              response_missing_users = requests.post(productsecurity_notifications_slack, data=json.dumps(slack_message_failed),headers={'Content-Type': 'application/json'})
+              if response_missing_users.status_code != 200:
+                raise ValueError('Request to slack returned an error %s, the response is:\n%s' % (response_missing_users.status_code, response_missing_users.text))
+
+
+  successful_pullRequest:
+    runs-on: ubuntu-latest
+    needs: [build, Validate-IAM-Policies]
+    if: success() && github.event_name == 'pull_request'
+    env: 
+      repoName: "${{needs.build.outputs.repoIdentifier}}"
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACKWEBHOOK }}
+    
+    steps:
+      - name: Checkout 
+        uses: actions/checkout@v2
+
+      - name: slack notification
+        if: success()
+        env:
+          orgRepo: "${{ github.repository }}"
+          pullno: "${{ github.event.number }}"
+        uses: jannekem/run-python-script-action@v1.2
+        with:
+          script: |
+            import os
+            import json
+            import requests
+            
+            slack_webhook_url = os.environ['SLACK_WEBHOOK_URL']
+            repositoryName = os.environ['orgRepo']
+            channelName = repositoryName.replace('product-security-aws-tiers-','')
+            channelName = channelName + "-tier-access"
+            pullreqNumber = os.environ['pullno']
+            PR_url = f"https://github.com/{repositoryName}/pull/{pullreqNumber}"
+            PR_files_url = f"{PR_url}/files"
+            message = f'''<!here> Your recent <{PR_url}|*PR #{pullreqNumber}*> has passed Validation and has been successfully submitted. *:celebrate:*
+            The Product Security team is aware of this PR and will review it in the order it’s received.
+            '''
+
+            slack_message = {
+            'channel': channelName,
+            'text': message
+            }  
+            
+            response = requests.post(slack_webhook_url, data=json.dumps(slack_message),headers={'Content-Type': 'application/json'})
+            if response.status_code != 200:
+                raise ValueError('Request to slack returned an error %s, the response is:\n%s' % (response.status_code, response.text))
+
+  Prep-CFT-nongroup:
+    runs-on: ubuntu-latest
+    needs: [validate_team_members_json, build, Validate-IAM-Policies]
+    if: success() && github.ref == 'refs/heads/master'
+    outputs:
+      errormsg: ${{ steps.create-policy-json.outputs.errormsg }}
+    env: 
+      repoName: "${{needs.build.outputs.repoIdentifier}}"
+    strategy:
+      fail-fast: false
+      matrix:
+        account_id: ${{fromJson(needs.build.outputs.matrix)}}
+    steps:
+      - name: Checkout 
+        uses: actions/checkout@v2
+
+      - name: Setup Python
+        uses: actions/setup-python@v2.2.2
+        with:
+          python-version: 3.9
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install awscli
+          pip install boto3
+          pip install troposphere[policy]
+
+      - name: Download iam compiled files from "validate-IAM-Policies" job
+        continue-on-error: true
+        uses: actions/download-artifact@v2.0.10
+        with:
+          name: iam-policy-compile-${{ matrix.account_id }}
+          path: ./iam-policy-compile-${{ matrix.account_id }}
+
+      - name: Download valid team tiers file
+        uses: actions/download-artifact@v2.0.10
+        with:
+          name: valid_team_tiers.txt
+      
+      - name: Display structure of downloaded files
+        run: ls -R
+
+      - name: create policy json
+        uses: jannekem/run-python-script-action@v1.2
+        id: create-policy-json
+        with:
+          script: |
+            import os
+            import json
+            import boto3
+            import sys
+            import re
+            from array import array
+            from pathlib import Path
+            from awacs.aws import Allow, Deny, Statement, Principal, Policy, Action
+            from troposphere import iam
+            from troposphere import Template, Output
+            from troposphere import Tags, GetAtt, Ref, Sub, Export
+            global policydict
+            policydict, roledict = {}, {}
+            policylist = []
+            app = os.environ['repoName']
+
+            f_team_members = open('team_members.json', "r")
+            data_team_members = json.loads(f_team_members.read())
+            
+            ##################################### Initializing CF template ################################# 
+            
+            t = Template()
+            t.set_version("2010-09-09")
+
+            ############## Definition to create or update policy ##################
+
+            def operate_policy(policyfilename):
+              data = {}
+              with open(policyfilename) as f:
+                data = json.load(f)
+              # print(data)
+              policyname = re.sub(r'\W+', '', Path(policyfilename).stem.replace('_', '').title())
+              # policyname = f"Policy{app}${{ matrix.account_id }}{policyname}"
+              policyname = f"Policy{app}{policyname}"
+              print(policyname)
+              mp = iam.ManagedPolicy(policyname)
+              # mp.ManagedPolicyName = f"pol{policyname}"
+              mp.ManagedPolicyName = policyname
+              mp.PolicyDocument = data
+              t.add_resource(mp)
+              # print(t.to_yaml())
+              return(policyname)
+            
+            ############## Definition to create or update role ##################
+
+            #####Create Role Trust Policy #####
+
+            def getTrustPolicyDoc(TierUserList):
+              stmt, PrincipalsList = [], []
+              pdoc, stmtpolicy1, stmtpolicy2, PrincipalDict1, PrincipalDict2, Condition, Samldict  = {}, {}, {}, {}, {}, {}, {}
+
+              for i in TierUserList:
+                  PrincipalsList.append(i)
+              PrincipalDict1['AWS'] = PrincipalsList
+              PrincipalDict2['Federated'] = f"arn:aws:iam::${{ matrix.account_id }}:saml-provider/Pluto-Google"
+              Samldict['SAML:aud'] = "https://signin.aws.amazon.com/saml"
+              Condition['StringEquals'] = Samldict
+              
+              stmtpolicy1['Effect'] = 'Allow'
+              stmtpolicy1['Action'] = 'sts:AssumeRole'
+              stmtpolicy1['Principal'] = PrincipalDict1
+              
+              stmtpolicy2['Effect'] = 'Allow'
+              stmtpolicy2['Action'] = 'sts:AssumeRoleWithSAML'
+              stmtpolicy2['Principal'] = PrincipalDict2
+              stmtpolicy2['Condition'] = Condition
+              
+              stmt.append(stmtpolicy1)
+              stmt.append(stmtpolicy2)
+
+              pdoc['Version'] = '2012-10-17'
+              pdoc['Statement'] = stmt
+
+              return json.dumps(pdoc, indent = 1)
+
+            #####Create Role #####
+
+            def operate_role(rname, rolefilename, managedpolicyarnlist):
+              roledata = {}
+              with open(rolefilename) as f:
+                roledata = json.load(f)
+              # print(roledata)
+              # rolename = re.sub(r'\W+', '', Path(rolefilename).stem.replace('_', '').lower())
+              rolename = re.sub(r'\W+', '', rname.replace('_', '').title())
+              rolename = f"{app}{rolename}"
+              print(rolename)
+              ro = iam.Role(f"Role{rolename}")
+              ro.RoleName = rolename
+              ro.AssumeRolePolicyDocument = roledata
+              ro.ManagedPolicyArns = managedpolicyarnlist
+              t.add_resource(ro)
+              # print(t.to_yaml())
+              return(rolename)
+            
+            ############## Preparing CFT #################
+            
+            ##### For Policies #####
+
+            policy_directory = f"iam-policy-compile-${{ matrix.account_id }}/${{ matrix.account_id }}"
+            if os.path.exists(policy_directory):
+              pol_list = os.listdir(policy_directory)
+            else:
+              pol_list = []
+            AccountTierList = [name+"-01.json" for name in os.listdir("./${{ matrix.account_id }}") if os.path.isdir(f"./${{ matrix.account_id }}/{name}")]
+            print("Account tier list is: ")
+            print(AccountTierList)
+            pol_list.extend(AccountTierList)
+            pol_list = list(set(pol_list))
+            for item in pol_list:
+              getpolname = ''
+              if os.path.exists(f"{policy_directory}/{item}"):
+                getpolname = operate_policy(f"{policy_directory}/{item}")
+              item = item.replace('.json','')
+              # policylist.append(getpolname)
+              policydict[item] = getpolname
+            
+            ##### For Roles #####
+
+            policydictkeyslist = sorted(list(set(policydict.keys())))
+            print(policydictkeyslist)
+            with open('valid_team_tiers.txt') as file:
+              whole_tiers_allowed = sorted([line.rstrip() for line in file])
+            tiers_of_account = sorted(list(set([s.split('-', 1)[0] for s in pol_list])))
+            tiers_min_value = int(tiers_of_account[0].replace('Tier',''))
+            tiers_max_value = int(whole_tiers_allowed[-1].replace('Tier',''))
+            total_tiers = ["Tier"+str(s) for s in range(tiers_min_value, (tiers_max_value+1))]
+            print(f"total tiers are {total_tiers}")
+            role_tiers_to_be_created = sorted(list(set(whole_tiers_allowed) & set(total_tiers)))
+            print(role_tiers_to_be_created)
+            for i in role_tiers_to_be_created:
+              arnlist = []
+              current_tier = int(i.replace('Tier',''))
+              TierUsersList = data_team_members[i]
+              with open(f"trust_doc_{i}.json", 'w') as f:
+                f.write(getTrustPolicyDoc(TierUsersList)) 
+              for x in range(tiers_min_value, (current_tier+1)):
+                inherit_json_path = f"./${{ matrix.account_id }}/Tier{x}/inherit.json"
+                if x != current_tier:
+                  if not os.path.exists(inherit_json_path):
+                    [arnlist.append(policydict[item]) for item in policydictkeyslist if f"Tier{x}-" in item if policydict[item] != '']
+                
+                if x == current_tier:
+                  [arnlist.append(policydict[item]) for item in policydictkeyslist if f"Tier{x}-" in item if policydict[item] != '']
+              arnlist = list(set([Ref(y) for y in arnlist]))
+              for x in range(tiers_min_value, (current_tier+1)): 
+                attached_policies_path = f"./${{ matrix.account_id }}/Tier{x}/attached_policies.json"
+                attached_policies_list = []
+                if os.path.exists(attached_policies_path):
+                  f_attached_policies = open(attached_policies_path, "r")
+                  data_attached_policies = json.loads(f_attached_policies.read())
+                  inherit_json_path = f"./${{ matrix.account_id }}/Tier{x}/inherit.json"
+                  if x != current_tier:
+                    if not os.path.exists(inherit_json_path):
+                      attached_policies_list = data_attached_policies['policies']
+                      arnlist.extend(attached_policies_list)
+                  
+                  if x == current_tier:
+                    attached_policies_list = data_attached_policies['policies']
+                    arnlist.extend(attached_policies_list) 
+                  arnlist = list(set(arnlist))
+              print(arnlist)
+              print(len(arnlist))
+              if len(arnlist) > 20:
+                print(f"::set-output name=errormsg::More than 20 attached polices in { i }")
+                raise ValueError(f"Error More than 20 attached polices to { i }")
+              getrolname = operate_role(i, f"trust_doc_{i}.json", arnlist)
+              roledict[i] = getrolname
+            
+            with open(f"roledict_${{ matrix.account_id }}.json", 'w') as file:
+              file.write(json.dumps(roledict, indent = 1))
+            print(t.to_yaml())
+            with open(f"CFT_{app}_${{ matrix.account_id }}_nongroup.yaml", 'w') as f:
+              f.write(t.to_yaml())
+
+             
+      - name: Upload CFT nongroup
+        uses: actions/upload-artifact@v2.2.4
+        with: 
+          name: CFT_${{ env.repoName }}_${{ matrix.account_id }}_nongroup.yaml
+          retention-days: 3
+          path: ./CFT_${{ env.repoName }}_${{ matrix.account_id }}_nongroup.yaml
+
+      - name: Upload roledict
+        uses: actions/upload-artifact@v2.2.4
+        with: 
+          name: roledict_${{ matrix.account_id }}.json
+          retention-days: 3
+          path: ./roledict_${{ matrix.account_id }}.json
+       
+  Prep-CFT-group:
+    runs-on: ubuntu-latest
+    needs: [validate_team_members_json, build, Validate-IAM-Policies, Prep-CFT-nongroup]
+    if: success() && github.ref == 'refs/heads/master'
+    env: 
+      repoName: "${{needs.build.outputs.repoIdentifier}}" 
+    steps:
+      - name: Checkout 
+        uses: actions/checkout@v2
+
+      - name: Setup Python
+        uses: actions/setup-python@v2.2.2
+        with:
+          python-version: 3.9
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install awscli
+          pip install boto3
+          pip install troposphere[policy]
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v2.0.10
+        with:
+          path: allartifacts
+      
+      - name: Display structure of downloaded files
+        run: ls -R
+
+      - name: create policy json
+        uses: jannekem/run-python-script-action@v1.2
+        with:
+          script: |
+            import os
+            import json
+            import boto3
+            import sys
+            import re
+            from array import array
+            from pathlib import Path
+            from awacs.aws import Allow, Deny, Statement, Principal, Policy, Action
+            from troposphere import iam
+            from troposphere import Template, Output
+            from troposphere import Tags, GetAtt, Ref, Sub, Export
+            global policydict
+            roledict = {}
+            roledictkeyslist = []
+            TierRoledict = {}
+            app = os.environ['repoName']
+
+            f_team_members = open('team_members.json', "r")
+            data_team_members = json.loads(f_team_members.read())
+
+            f_manifest = open('./allartifacts/manifest.json/manifest.json', "r")
+            data_manifest = json.loads(f_manifest.read())
+            max, awsIDs, accountIds = int(data_manifest['highestTier']), data_manifest['ids'], data_manifest['accounts'] 
+            
+            ##################################### Initializing CF template ################################# 
+            
+            t = Template()
+            t.set_version("2010-09-09")
+
+            def operate_policy(policyfilename):
+              data = {}
+              with open(policyfilename) as f:
+                data = json.load(f)
+              # print(data)
+              policyname = re.sub(r'\W+', '', Path(policyfilename).stem.replace('_', '').title())
+              policyname = f"{policyname}"
+              print(policyname)
+              mp = iam.ManagedPolicy(policyname)
+              mp.ManagedPolicyName = policyname
+              mp.PolicyDocument = data
+              t.add_resource(mp)
+              # print(t.to_yaml())
+              return(policyname)
+
+            ############## Definition to create or update group ##################
+
+            #####Create Group Policy #####
+
+            def getGroupPolicyDoc(TierRoleList):
+              stmt, ResourcesList = [], []
+              pdoc, stmtpolicy1 = {}, {}
+
+              for x in TierRoleList:
+                ResourcesList.append(x) 
+              
+              stmtpolicy1['Effect'] = 'Allow'
+              stmtpolicy1['Action'] = 'sts:AssumeRole'
+              stmtpolicy1['Resource'] = ResourcesList
+              
+              stmt.append(stmtpolicy1)
+
+              pdoc['Version'] = '2012-10-17'
+              pdoc['Statement'] = stmt
+              
+              print(json.dumps(pdoc, indent = 1))
+              return json.dumps(pdoc, indent = 1)
+
+            #####Create Group #####
+
+            def operate_group(groupname, groupfilename):
+              getpolicyname = operate_policy(groupfilename)
+              groupname = re.sub(r'\W+', '', groupname.replace('_', ' ').replace('assumerole', '').replace('_', ''))
+              groupname = f"{groupname}"
+              print(groupname)
+              gr = iam.Group(groupname)
+              gr.GroupName = groupname
+              gr.ManagedPolicyArns = [Ref(getpolicyname)]
+              t.add_resource(gr)
+              return(groupname)
+            
+            def operate_userstogroup(groupname, userlist):
+              utg = iam.UserToGroupAddition(f"usersaddedto{groupname}")
+              utg.GroupName = Ref(groupname)
+              utg.Users = userlist
+              t.add_resource(utg)
+
+            
+            ############## Preparing CFT #################
+
+            ##### For Groups #####
+            for acct in awsIDs:
+              roles_file_location = f"./allartifacts/roledict_{acct}.json/roledict_{acct}.json"
+              with open(roles_file_location) as f:
+                roledict[acct] = json.load(f)
+              print(roledict[acct])
+
+            for a in awsIDs:
+              roledictkeyslist = sorted(list(set(roledictkeyslist + list(roledict[a].keys()))))
+            print(roledictkeyslist)
+
+            for i in roledictkeyslist:
+              TierRoleList = []
+              for acct in awsIDs:
+                if i in roledict[acct]:
+                  rolenameadded = roledict[acct][i]
+                  print(f"role name added is {rolenameadded}")
+                  TierRoleList.append(f"arn:aws:iam::{acct}:role/{rolenameadded}")
+              TierRoledict[i] = TierRoleList
+              print(TierRoledict[i])
+
+            for i in roledictkeyslist:
+              TierUsersOrigList = data_team_members[i]
+              TierUsersList = [re.search('user/(.*)', item).group(1) for item in TierUsersOrigList] 
+              TierRoles = TierRoledict[i]
+              with open(f"{app}_grouppolicy_doc_{i}.json", 'w') as f:
+                f.write(getGroupPolicyDoc(TierRoles)) 
+              grname = operate_group(f"{app}_{i}", f"{app}_grouppolicy_doc_{i}.json")
+              operate_userstogroup(grname, TierUsersList) 
+
+            print(t.to_yaml())
+            with open(f"CFT_{app}_group.yaml", 'w') as f:
+              f.write(t.to_yaml())
+             
+      - name: Upload CFT group
+        uses: actions/upload-artifact@v2.2.4
+        with: 
+          name: CFT_${{ env.repoName }}_group.yaml
+          retention-days: 3
+          path: ./CFT_${{ env.repoName }}_group.yaml
+
+  upload_state_to_s3bucket:
+   runs-on: ubuntu-latest
+   if: always() && github.ref == 'refs/heads/master'
+   needs: [build]
+   env: 
+      repoName: "${{needs.build.outputs.repoIdentifier}}"
+
+   steps:
+      - name: Checkout 
+        uses: actions/checkout@v2
+
+      - name: Setup Python
+        uses: actions/setup-python@v2.2.2
+        with:
+          python-version: 3.9
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install awscli
+          pip install boto3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_ANALYZER_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_ACCESS_ANALYZER_SECRET }}
+          aws-region: us-east-1
+          mask-aws-account-id: 'no'
+
+      - name: Download manifest.json from "build" job
+        uses: actions/download-artifact@v2.0.10
+        with:
+          name: manifest.json
+
+      - name: upload manifest to s3 bucket as state file
+        uses: jannekem/run-python-script-action@v1.2
+        with:
+          script: |
+            import os
+            import sys
+            import json
+            import boto3
+            import re
+            import logging
+            from botocore.exceptions import ClientError
+            
+
+            s3 = boto3.resource('s3')
+            bucket = "iam-tier-deploy-state"
+            app = os.environ['repoName']
+            objKey = f"{app}-statefile.json"
+
+            try:
+              upld_response = s3.meta.client.upload_file('manifest.json', bucket, objKey)
+            except ClientError as e:
+              logging.error(e)
+              sys.exit('Error uploading state file')
+
+  upload_CFT_templates_to_s3bucket:
+   runs-on: ubuntu-latest
+   if: always() && github.ref == 'refs/heads/master'
+   needs: [build, Prep-CFT-group]
+   env: 
+      repoName: "${{needs.build.outputs.repoIdentifier}}"
+   strategy:
+      fail-fast: true
+      matrix:
+        account_id: ${{fromJson(needs.build.outputs.matrix)}} 
+
+   steps:
+      - name: Checkout 
+        uses: actions/checkout@v2
+
+      - name: Setup Python
+        uses: actions/setup-python@v2.2.2
+        with:
+          python-version: 3.9
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install awscli
+          pip install boto3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_ANALYZER_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_ACCESS_ANALYZER_SECRET }}
+          aws-region: us-east-1
+          role-to-assume: arn:aws:iam::${{ matrix.account_id }}:role/aws-deploy-tier
+          role-duration-seconds: 3600
+          role-skip-session-tagging: true
+          mask-aws-account-id: 'no'
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v2.0.10
+        with:
+          path: allartifacts
+      
+      - name: Display structure of downloaded files
+        run: ls -R
+
+      - name: upload cft to s3 bucket as state file
+        uses: jannekem/run-python-script-action@v1.2
+        with:
+          script: |
+            import os
+            import sys
+            import json
+            import boto3
+            import re
+            import logging
+            from botocore.exceptions import ClientError
+
+            f_manifest = open('./allartifacts/manifest.json/manifest.json', "r")
+            data_manifest = json.loads(f_manifest.read())
+            max, awsIDs, accountIds = int(data_manifest['highestTier']), data_manifest['ids'], data_manifest['accounts'] 
+
+            s3 = boto3.resource('s3')
+            bucket = "iam-tier-deploy-state"
+            app = os.environ['repoName']
+            # objKey = f"{app}-statefile.json"
+
+            # for acct in awsIDs:
+            objKey = f"CFT_{app}_${{ matrix.account_id }}_nongroup.yaml"
+            cftfile = f"./allartifacts/CFT_{app}_${{ matrix.account_id }}_nongroup.yaml/CFT_{app}_${{ matrix.account_id }}_nongroup.yaml"
+            try:
+              upld_response = s3.meta.client.upload_file(cftfile, bucket, objKey)
+            except ClientError as e:
+              logging.error(e)
+              sys.exit('Error uploading state file')
+
+            # objKey = f"CFT_{app}_group.yaml"
+            # cftfile = f"./allartifacts/CFT_{app}_group.yaml/CFT_{app}_group.yaml" 
+            # try:
+            #     upld_response = s3.meta.client.upload_file(cftfile, bucket, objKey)
+            # except ClientError as e:
+            #     logging.error(e)
+            #     sys.exit('Error uploading state file')
+        
+  Exec_CFT_nongroup:
+    runs-on: ubuntu-latest
+    #needs: [build, organize_tiers, validate_team_members_json, get_state]
+    needs: [build, upload_CFT_templates_to_s3bucket]
+    if: success() && github.ref == 'refs/heads/master'
+    env: 
+      repoName: "${{needs.build.outputs.repoIdentifier}}"
+    strategy:
+      fail-fast: true
+      matrix:
+        account_id: ${{fromJson(needs.build.outputs.matrix)}}
+    
+    steps:
+      - name: Checkout 
+        uses: actions/checkout@v2
+
+      - name: Setup Python
+        uses: actions/setup-python@v2.2.2
+        with:
+          python-version: 3.9
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install awscli
+          pip install boto3
+      
+      - name: Configure AWS credentials to assume role in ${{ matrix.account_id }} account
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_ANALYZER_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_ACCESS_ANALYZER_SECRET }}
+          aws-region: us-east-1
+          role-to-assume: arn:aws:iam::${{ matrix.account_id }}:role/aws-deploy-tier
+          role-duration-seconds: 3600
+          role-skip-session-tagging: true
+          mask-aws-account-id: 'no'
+
+      - name: Download CFT template for non-group resources
+        uses: actions/download-artifact@v2.0.10
+        with:
+          name: CFT_${{ env.repoName }}_${{ matrix.account_id }}_nongroup.yaml
+      
+      # - run: aws sts get-caller-identity
+    
+      - name: Check if CFT already exists
+        id: cftstackid
+        uses: jannekem/run-python-script-action@v1.2
+        with:
+          script: |
+            import sys
+            import os 
+            import boto3
+            import json
+            cfnstack, tagdict = {}, {}
+            tagjson = []
+            stkid = ""
+            stack_name = f"${{ env.repoName }}Tiers"
+
+            ##### Returns Cloudformation Client Object ##### 
+
+            def cfn_conn(region):
+              cfn = boto3.client('cloudformation', region_name=region)
+              return cfn
+
+            ##### Determines if CloudFormation stack exists with given name. #####
+
+            def stack_exists(stack_name, token):
+              if token:
+                response = cfn.list_stacks(NextToken=token)
+              else:
+                response = cfn.list_stacks()
+              if 'StackSummaries' in response:
+                  stacks = response['StackSummaries']
+                  for stack in stacks:
+                      if stack['StackName'] == stack_name:
+                          if stack['StackStatus'] != 'DELETE_COMPLETE':
+                              # print(f"Found existing stack with name {stack_name}")
+                              return True
+              if 'NextToken' in response:
+                  return stack_exists(stack_name, response['NextToken'])
+              return False
+
+            ##### Creates an Empty CloudFormation stack with given name, but no infrastructure. #####
+
+            def create_empty_stack(stack_name, cfn):
+              json = """
+              {
+                'AWSTemplateFormatVersion' : '2010-09-09',
+                'Conditions' : {
+                    'HasNot': { 'Fn::Equals' : [ 'a', 'b' ] }
+                },
+                'Resources' : {
+                    'NullResource' : {
+                        'Type' : 'Custom::NullResource',
+                        'Condition' : 'HasNot'
+                    }
+                }
+              }
+              """
+              cfndetails = cfn.create_stack(
+                  StackName=stack_name,
+                  TemplateBody=json
+              )
+              waiter = cfn.get_waiter('stack_create_complete')
+              waiter.wait(
+                  StackName=stack_name,
+                  WaiterConfig={
+                      'Delay': 3,
+                      'MaxAttempts': 100
+                  }
+              )
+              # print(f"Successfully created stack {stack_name}")
+              return cfndetails
+
+            ##### Create Stack if it doesn't exist and get stackid #####
+
+            cfn = cfn_conn('us-east-1')
+            
+            if not stack_exists(stack_name, None):
+              # print(f"Creating stack with name {stack_name}")
+              cfnstack = create_empty_stack(stack_name, cfn)
+              response1 = cfn.update_termination_protection(EnableTerminationProtection=True,StackName=stack_name)
+              stkid = cfnstack['StackId']
+            else:
+              cfnstack = cfn.describe_stacks(StackName=stack_name)
+              response1 = cfn.update_termination_protection(EnableTerminationProtection=True,StackName=stack_name)
+              stkid = cfnstack['Stacks'][0]['StackId']
+            
+            ##### Create tag json with keys and values #####
+            tagdict["IAMTierAutomation"] = "true"
+            tagdict["Repo"] = "GHA"
+            tagdict["StackId"] = stkid
+            tagjson = [{"Key": k, "Value": v} for k,v in tagdict.items()]
+            print(tagjson)
+            # with open(f"tags_${{ matrix.account_id }}_nongroup.json", 'w') as tg:
+            #   tg.write(json.dumps(tagjson, indent=4))
+
+      - name: Deploy to AWS using CloudFormation
+        uses: aws-actions/aws-cloudformation-github-deploy@v1.0.4
+        with:
+          name: ${{ env.repoName }}Tiers
+          template: https://iam-tier-deploy-state.s3.amazonaws.com/CFT_${{ env.repoName }}_${{ matrix.account_id }}_nongroup.yaml
+          capabilities: "CAPABILITY_NAMED_IAM, CAPABILITY_IAM"
+          no-fail-on-empty-changeset: "1"
+          termination-protection: "1"
+          # tags: >
+          #   "${{ steps.cftstackid.outputs.stdout }}" 
+          # [{ "Key": "Team", "Value": "ProdSec" },
+          # {"Key": "DeployModel", "Value": "GHA"},
+          # {"Key": "StackId", "Value": "${{ steps.cftstackid.outputs.stdout }}"}]
+          # parameter-overrides: "EC2InstanceType=t2.micro"
+
+  Exec_CFT_group:
+    runs-on: ubuntu-latest
+    #needs: [build, organize_tiers, validate_team_members_json, get_state]
+    needs: [build, Exec_CFT_nongroup]
+    if: success() && github.ref == 'refs/heads/master'
+    env: 
+      repoName: "${{needs.build.outputs.repoIdentifier}}"
+    
+    steps:
+      - name: Checkout 
+        uses: actions/checkout@v2
+
+      - name: Setup Python
+        uses: actions/setup-python@v2.2.2
+        with:
+          python-version: 3.9
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install awscli
+          pip install boto3
+      
+      - name: Configure AWS credentials to assume role in ${{ matrix.account_id }} account
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_ANALYZER_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_ACCESS_ANALYZER_SECRET }}
+          aws-region: us-east-1
+          mask-aws-account-id: 'no'
+
+      - name: Download CFT template for non-group resources
+        uses: actions/download-artifact@v2.0.10
+        with:
+          name: CFT_${{ env.repoName }}_group.yaml
+      
+      # - run: aws sts get-caller-identity
+
+      - name: Check if CFT already exists
+        id: cftstackid
+        uses: jannekem/run-python-script-action@v1.2
+        with:
+          script: |
+            import sys
+            import os 
+            import boto3
+            import json
+            cfnstack, tagdict = {}, {}
+            tagjson = []
+            stkid = ""
+            stack_name = f"${{ env.repoName }}Tiers-Group"
+
+            ##### Returns Cloudformation Client Object ##### 
+
+            def cfn_conn(region):
+              cfn = boto3.client('cloudformation', region_name=region)
+              return cfn
+
+            ##### Determines if CloudFormation stack exists with given name. #####
+
+            def stack_exists(stack_name, token):
+              if token:
+                response = cfn.list_stacks(NextToken=token)
+              else:
+                response = cfn.list_stacks()
+              if 'StackSummaries' in response:
+                  stacks = response['StackSummaries']
+                  for stack in stacks:
+                      if stack['StackName'] == stack_name:
+                          if stack['StackStatus'] != 'DELETE_COMPLETE':
+                              # print(f"Found existing stack with name {stack_name}")
+                              return True
+              if 'NextToken' in response:
+                  return stack_exists(stack_name, response['NextToken'])
+              return False
+
+            ##### Creates an Empty CloudFormation stack with given name, but no infrastructure. #####
+
+            def create_empty_stack(stack_name, cfn):
+              json = """
+              {
+                'AWSTemplateFormatVersion' : '2010-09-09',
+                'Conditions' : {
+                    'HasNot': { 'Fn::Equals' : [ 'a', 'b' ] }
+                },
+                'Resources' : {
+                    'NullResource' : {
+                        'Type' : 'Custom::NullResource',
+                        'Condition' : 'HasNot'
+                    }
+                }
+              }
+              """
+              cfndetails = cfn.create_stack(
+                  StackName=stack_name,
+                  TemplateBody=json
+              )
+              waiter = cfn.get_waiter('stack_create_complete')
+              waiter.wait(
+                  StackName=stack_name,
+                  WaiterConfig={
+                      'Delay': 3,
+                      'MaxAttempts': 100
+                  }
+              )
+              # print(f"Successfully created stack {stack_name}")
+              return cfndetails
+
+            ##### Create Stack if it doesn't exist and get stackid #####
+
+            cfn = cfn_conn('us-east-1')
+            
+            if not stack_exists(stack_name, None):
+              # print(f"Creating stack with name {stack_name}")
+              cfnstack = create_empty_stack(stack_name, cfn)
+              response1 = cfn.update_termination_protection(EnableTerminationProtection=True,StackName=stack_name)
+              stkid = cfnstack['StackId']
+            else:
+              cfnstack = cfn.describe_stacks(StackName=stack_name)
+              response1 = cfn.update_termination_protection(EnableTerminationProtection=True,StackName=stack_name)
+              stkid = cfnstack['Stacks'][0]['StackId']
+            
+            ##### Create tag json with keys and values #####
+            tagdict["IAMTierAutomation"] = "true"
+            tagdict["Repo"] = "GHA"
+            tagdict["StackId"] = stkid
+            tagjson = [{"Key": k, "Value": v} for k,v in tagdict.items()]
+            print(tagjson)
+            # with open(f"tags_${{ matrix.account_id }}_nongroup.json", 'w') as tg:
+            #   tg.write(json.dumps(tagjson, indent=4))
+
+      - name: Deploy to AWS using CloudFormation
+        uses: aws-actions/aws-cloudformation-github-deploy@v1.0.4
+        with:
+          name: ${{ env.repoName }}Tiers-Group
+          template: CFT_${{ env.repoName }}_group.yaml
+          capabilities: "CAPABILITY_NAMED_IAM, CAPABILITY_IAM"
+          no-fail-on-empty-changeset: "1"
+          termination-protection: "1"
+          # tags: >
+          #   [{ "Key": "Team", "Value": "ProdSec" },
+          #   {"Key": "DeployModel", "Value": "GHA"}]
+          # parameter-overrides: "EC2InstanceType=t2.micro"
+
+  # NotifyTeam:
+  #   runs-on: ubuntu-latest
+  #   needs: [build, Exec_CFT_group]
+  #   if: success() && github.ref == 'refs/heads/master'
+  #   env: 
+  #     repoName: "${{needs.build.outputs.repoIdentifier}}"
+  #   steps:
+  #     - name: Checkout 
+  #       uses: actions/checkout@v2
+
+  #     - name: Setup Python
+  #       uses: actions/setup-python@v2.2.2
+  #       with:
+  #         python-version: 3.9
+
+  #     - name: Install dependencies
+  #       run: |
+  #         python -m pip install --upgrade pip
+  #         pip install awscli
+  #         pip install boto3
+  #         pip install requests
+      
+  #     - name: Configure AWS credentials to assume role in ${{ matrix.account_id }} account
+  #       uses: aws-actions/configure-aws-credentials@v1
+  #       with:
+  #         aws-access-key-id: ${{ secrets.AWS_ACCESS_ANALYZER_KEY }}
+  #         aws-secret-access-key: ${{ secrets.AWS_ACCESS_ANALYZER_SECRET }}
+  #         aws-region: us-east-1
+  #         mask-aws-account-id: 'no'
+      
+  #     # - run: aws sts get-caller-identity
+
+  #     - name: Notify users individually
+  #       uses: jannekem/run-python-script-action@v1.2
+  #       with:
+  #         script: |
+  #           import sys
+  #           import os 
+  #           import boto3
+  #           import json
+  #           import requests
+  #           import logging
+
+  #           f_team_members = open('team_members.json', "r")
+  #           data_team_members = json.loads(f_team_members.read())
+  #           notifyuserslist = []  
+  #           for x in data_team_members.values():
+  #             notifyuserslist.extend(x)
+  #           notifyuserslist = list(set(notifyuserslist))
+  #           desired_list = [ x.split('/',1)[1] for x in notifyuserslist ]
+            
+  #           try:
+  #             url = "https://hooks.slack.com/workflows/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"
+  #             headers = {'content-type': 'application/json'}
+  #             for y in desired_list:  
+  #               payload = '{"SlackEmail": "'+y+'"}'
+  #               r = requests.post(url, data=payload, headers=headers)
+  #           except ClientError as e:
+  #             logging.error(e)
+  
+  # upload_CFT_templates_to_s3bucket:
+  #  runs-on: ubuntu-latest
+  #  if: always() && github.ref == 'refs/heads/master'
+  #  needs: [build, Exec_CFT_group]
+  #  env: 
+  #     repoName: "${{needs.build.outputs.repoIdentifier}}"
+  #  strategy:
+  #     fail-fast: true
+  #     matrix:
+  #       account_id: ${{fromJson(needs.build.outputs.matrix)}} 
+
+  #  steps:
+  #     - name: Checkout 
+  #       uses: actions/checkout@v2
+
+  #     - name: Setup Python
+  #       uses: actions/setup-python@v2.2.2
+  #       with:
+  #         python-version: 3.9
+
+  #     - name: Install dependencies
+  #       run: |
+  #         python -m pip install --upgrade pip
+  #         pip install awscli
+  #         pip install boto3
+
+  #     - name: Configure AWS credentials
+  #       uses: aws-actions/configure-aws-credentials@v1
+  #       with:
+  #         aws-access-key-id: ${{ secrets.AWS_ACCESS_ANALYZER_KEY }}
+  #         aws-secret-access-key: ${{ secrets.AWS_ACCESS_ANALYZER_SECRET }}
+  #         aws-region: us-east-1
+  #         mask-aws-account-id: 'no'
+
+  #     - name: Download all artifacts
+  #       uses: actions/download-artifact@v2.0.10
+  #       with:
+  #         path: allartifacts
+      
+  #     - name: Display structure of downloaded files
+  #       run: ls -R
+
+  #     - name: upload cft to s3 bucket as state file
+  #       uses: jannekem/run-python-script-action@v1.2
+  #       with:
+  #         script: |
+  #           import os
+  #           import sys
+  #           import json
+  #           import boto3
+  #           import re
+  #           import logging
+  #           from botocore.exceptions import ClientError
+
+  #           f_manifest = open('./allartifacts/manifest.json/manifest.json', "r")
+  #           data_manifest = json.loads(f_manifest.read())
+  #           max, awsIDs, accountIds = int(data_manifest['highestTier']), data_manifest['ids'], data_manifest['accounts'] 
+
+  #           s3 = boto3.resource('s3')
+  #           bucket = "iam-tier-deploy-state"
+  #           app = os.environ['repoName']
+  #           # objKey = f"{app}-statefile.json"
+
+  #           for acct in awsIDs:
+  #             objKey = f"CFT_{app}_{acct}_nongroup.yaml"
+  #             cftfile = f"./allartifacts/CFT_{app}_{acct}_nongroup.yaml/CFT_{app}_{acct}_nongroup.yaml"
+  #             try:
+  #               upld_response = s3.meta.client.upload_file(cftfile, bucket, objKey)
+  #             except ClientError as e:
+  #               logging.error(e)
+  #               sys.exit('Error uploading state file')
+
+  #           objKey = f"CFT_{app}_group.yaml"
+  #           cftfile = f"./allartifacts/CFT_{app}_group.yaml/CFT_{app}_group.yaml" 
+  #           try:
+  #               upld_response = s3.meta.client.upload_file(cftfile, bucket, objKey)
+  #           except ClientError as e:
+  #               logging.error(e)
+  #               sys.exit('Error uploading state file')
+
+  stop-deployment: 
+    runs-on: ubuntu-latest
+    if: always() && github.ref == 'refs/heads/master'
+    needs: [build, Exec_CFT_group, Prep-CFT-nongroup]
+    env: 
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACKWEBHOOK }}
+      repoName: "${{needs.build.outputs.repoIdentifier}}"
+    steps:
+      - name: Checkout 
+        uses: actions/checkout@v2
+      
+      - uses: technote-space/workflow-conclusion-action@v2
+      
+      - run: mkdir dl
+
+      - name: Download all workflow run artifacts
+        uses: actions/download-artifact@v2
+        with:
+          path: ./dl
+
+      - name: Display structure of downloaded files
+        run: ls -R
+        working-directory: ./dl
+
+      - name: slack notification
+        env:
+          orgRepo: "${{ github.repository }}"
+          runid: "${{ github.run_id }}"
+          deployment_status: "${{ env.WORKFLOW_CONCLUSION }}"
+          PrepCFTnongroupError: ${{ needs.Prep-CFT-nongroup.outputs.errormsg }}
+        uses: jannekem/run-python-script-action@v1.2
+        with:
+          script: |
+            import os
+            import json
+            import requests
+            import os
+            
+            slack_webhook_url = os.environ['SLACK_WEBHOOK_URL']
+            gha_tier_discussion_slack = "https://hooks.slack.com/services/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"
+            productsecurity_internal_slack = "https://hooks.slack.com/services/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"
+            # productsecurity_notifications_slack = "https://hooks.slack.com/services/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"
+            productsecurity_notifications_slack = "https://hooks.slack.com/services/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" 
+            repositoryName = os.environ['orgRepo']
+            run_id = os.environ['runid']
+            channelName = repositoryName.replace('product-security-aws-tiers-','')
+            channelName = channelName + "-tier-access"
+            run_url = f"https://github.com/{repositoryName}/actions/runs/{run_id}"
+            deployment_state = os.environ['deployment_status']
+            team_members_link = f"https://github.com/{repositoryName}/blob/master/team_members.json"
+            # team_roles_link = f"https://github.com/{repositoryName}/blob/master/team_roles.md"
+            githubrepo_link = f"https://github.com/{repositoryName}"
+            app = os.environ['repoName']
+            print(f"app name is: {app}")
+            print(f"error is { os.environ['PrepCFTnongroupError'] }")
+            extra_error_msg = "" 
+            if os.environ['PrepCFTnongroupError'] != 'false':
+              if os.environ['PrepCFTnongroupError']: 
+                extra_error_msg = "*Extra Error Message: " + os.environ['PrepCFTnongroupError'] + "*"
+            stmt = f"View the <{run_url}|*Deployment Summary*>. { extra_error_msg }"
+            stmt_team = f'''{ extra_error_msg }
+              • Don’t worry! The <!subteam^S032DM9BNR1> is looking into the issue right now.
+              • Your Team Tier access has rolled back to the previous state until the <!subteam^S032DM9BNR1> fixes the issue.
+              • The <!subteam^S032DM9BNR1> will rerun the deploy once the issue is fixed and you’ll get a notification when the redeploy occurs.
+              '''
+            sym = ""
+            if deployment_state == 'failure':
+              deployment_state = 'Failed'
+              sym = ":x:"
+
+            if deployment_state == 'success':
+              deployment_state = 'Success'
+              sym = ":white_check_mark:"
+              stmt = f'''• All users in your team’s <{team_members_link}|*team_members.json*> file will have the access that is in the master branch of your <{githubrepo_link}|*GitHub Repository*>.'''
+            
+            message = f'''<!here> *Deployment Notification*
+            *Job ID: `{run_id}`*
+            *Status: `{deployment_state}` {sym}*
+            *Team: `{app}`*
+            {stmt}
+            ----------------------------------------------------------------------------------------------------------------------------------------
+            '''
+
+            message_team = f'''<!here> *Deployment Notification*
+            *Job ID: `{run_id}`*
+            *Status: `{deployment_state}` {sym}*
+            *Team: `{app}`*
+            {stmt_team}
+            ----------------------------------------------------------------------------------------------------------------------------------------
+            '''
+
+            slack_message = {
+            'channel': channelName,
+            'text': message     
+            }  
+
+            ###### Conditions ######
+
+            if deployment_state != "Success":
+              slack_message_failed = {
+              'channel': "product-security-tier-notifications",
+              'text': message
+              }
+              slack_failure_message_to_team = {
+              'channel': channelName,
+              'text': message_team
+              }
+              response = requests.post(productsecurity_notifications_slack, data=json.dumps(slack_message_failed),headers={'Content-Type': 'application/json'})
+              response1 = requests.post(slack_webhook_url, data=json.dumps(slack_failure_message_to_team),headers={'Content-Type': 'application/json'})
+               
+              if response.status_code != 200:
+                raise ValueError('Request to slack returned an error %s, the response is:\n%s' % (response.status_code, response.text)) 
+            else: 
+              response = requests.post(slack_webhook_url, data=json.dumps(slack_message),headers={'Content-Type': 'application/json'})
+              if response.status_code != 200:
+                raise ValueError('Request to slack returned an error %s, the response is:\n%s' % (response.status_code, response.text))
+                
